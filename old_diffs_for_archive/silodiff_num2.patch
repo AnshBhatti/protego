@@ -1,0 +1,59 @@
+commit 5d764fac4883093a4bd1f2f56bbcb8525601019f
+Author: dmendes6 <dmendes6@>
+Date:   Wed Apr 16 18:45:00 2025 -0600
+
+    .
+
+diff --git a/Makefile b/Makefile
+index 64b97cf..22a5901 100644
+--- a/Makefile
++++ b/Makefile
+@@ -30,13 +30,15 @@ silotpcc.o: CPPFLAGS += -I$(SILO_DIR) -I$(SILO_DIR)/third-party/lz4
+ spin-ix.o: CPPFLAGS += -I$(IX_DIR)/inc -I$(IX_DIR)/libix
+ silotpcc-ix.o: CPPFLAGS += -I$(IX_DIR)/inc -I$(IX_DIR)/libix
+ common-ix.o: CPPFLAGS += -I$(IX_DIR)/inc -I$(IX_DIR)/libix
+-common-shenango.o: CPPFLAGS += $(INC) $(CXXFLAGS) -I$(ROOT_PATH)/bindings/cc -I$(ROOT_PATH)/breakwater/inc -L$(ROOT_PATH)/breakwater -lbw
++common-shenango.o: CPPFLAGS += $(INC) $(CXXFLAGS) -I$(ROOT_PATH)/bindings/cc -I$(ROOT_PATH)/breakwater/inc
+ 
+ ## main references stuff that I only link/include in common-shenango.o
+ ## obviously I'm going to need to include it here too
+ 
+ silotpcc-shenango: silotpcc-shenango.o common-shenango.o silotpcc.o $(SILO_OBJS)
+-	$(CXX) -o $@ $^ $(LDFLAGS) ${SHENANGODIR}/shim/libshim.a -ldl $(RUNTIME_LIBS) $(ROOT_PATH)/bindings/cc/librt++.a -L$(SILO_DIR)/third-party/lz4 -llz4 -lnuma -ldb_cxx -pthread -ljemalloc
++	$(CXX) -o $@ $^ $(LDFLAGS) ${SHENANGODIR}/shim/libshim.a -ldl $(RUNTIME_LIBS) $(ROOT_PATH)/bindings/cc/librt++.a \
++	 -L$(SILO_DIR)/third-party/lz4 -llz4 -lnuma -ldb_cxx -pthread -ljemalloc \
++	 -L$(ROOT_PATH)/breakwater -lbw -I$(ROOT_PATH)/breakwater/inc
+ 
+ 
+ clean:
+diff --git a/common-shenango.cc b/common-shenango.cc
+index 5f64d3e..9c2edbf 100644
+--- a/common-shenango.cc
++++ b/common-shenango.cc
+@@ -54,6 +54,7 @@ class SharedTcpStream {
+ class RequestContext {
+  public:
+   RequestContext(std::shared_ptr<SharedTcpStream> c) : conn(c) {}
++  RequestContext() : {}
+   Payload p;
+   std::shared_ptr<SharedTcpStream> conn;
+   void *operator new(size_t size) {
+@@ -82,6 +83,7 @@ void HandleRequest(RequestContext *ctx) {
+ 
+   WARN_ON_ONCE(idx > 4);
+ 
++  // p is the payload from before
+   ctx->p.randomness = hton64(after);
+   /*
+   // (no longer?) todo! instead return result through writing to RPC context instead of the connection
+@@ -135,8 +137,8 @@ static void shenango_handler(struct srpc_ctx *bw_ctx)
+   Payload *request_header = reinterpret_cast<Payload *>(bw_ctx->req_buf);
+ 
+ 
+-  RequestContext *ctx; //= new RequestContext();
+-  //ctx->p = request_header->p;
++  ctx = new RequestContext();
++  ctx->p = request_header->p;
+ 
+   auto todo_work = [=] {
+     HandleRequest(ctx); //

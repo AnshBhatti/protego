@@ -1,0 +1,392 @@
+commit ed6544349515ad52cb64fcd63d55d0a7a2fd6784
+Author: dmendes6 <dmendes6@>
+Date:   Sun Apr 20 04:51:03 2025 -0600
+
+    .
+
+diff --git a/apps/storage_service/Makefile b/apps/storage_service/Makefile
+index f9a1355..4e28478 100644
+--- a/apps/storage_service/Makefile
++++ b/apps/storage_service/Makefile
+@@ -20,7 +20,9 @@ dep = $(obj:.o=.d)
+ all: storage_server
+ 
+ storage_server: $(storage_server_obj) $(librt_libs) $(RUNTIME_DEPS)
+-	$(LDXX) -o $@ $(LDFLAGS) ../../shim/libshim.a -ldl  $(obj) $(librt_libs) $(RUNTIME_LIBS) $(LIBS)
++	$(LDXX) -v -o $@ $(LDFLAGS) ../../shim/libshim.a -ldl  $(obj) $(librt_libs) $(RUNTIME_LIBS) $(LIBS) \
++	-L$(ROOT_PATH)/breakwater -lbw -I$(ROOT_PATH)/breakwater/inc \
++	-I$(ROOT_PATH)/bindings
+ 
+ ifneq ($(MAKECMDGOALS),clean)
+ -include $(dep)   # include all dep files in the makefile
+@@ -31,7 +33,8 @@ endif
+ %.d: %.cc
+ 	@$(CXX) $(CXXFLAGS) $< -MM -MT $(@:.d=.o) >$@
+ %.o: %.cc
+-	$(CXX) $(CXXFLAGS) -c $< -o $@
++	$(CXX) $(CXXFLAGS) -c $< -o $@ \
++	-I$(ROOT_PATH)/breakwater/inc -I$(ROOT_PATH)/bindings
+ 
+ .PHONY: clean
+ clean:
+diff --git a/apps/storage_service/storage_server.cc b/apps/storage_service/storage_server.cc
+index 6789b7b..cc8e220 100644
+--- a/apps/storage_service/storage_server.cc
++++ b/apps/storage_service/storage_server.cc
+@@ -7,6 +7,11 @@ extern "C" {
+ #include <openssl/conf.h>
+ #include <openssl/evp.h>
+ #include <openssl/err.h>
++
++#include <breakwater/breakwater.h>
++#include <breakwater/dagor.h>
++#include <breakwater/seda.h>
++#include <breakwater/nocontrol.h>
+ }
+ 
+ #include <fcntl.h>
+@@ -26,6 +31,16 @@ extern "C" {
+ 
+ #include "reflex.h"
+ 
++#define RPC_STAT_PORT 8002
++#define RPC_STAT_MAGIC 0xDEADBEEF
++const struct crpc_ops *crpc_ops;
++const struct srpc_ops *srpc_ops;
++// #include "cc/runtime.h"
++// #include "cc/net.h"
++// #include "cc/sync.h"
++// #include "cc/thread.h"
++
++
+ constexpr unsigned int kSectorSize = 512;
+ constexpr uint64_t kStorageServicePort = 5000;
+ 
+@@ -135,23 +150,83 @@ static void free_buf(char *buf, size_t sz) {
+ class RequestContext {
+  public:
+   RequestContext(std::shared_ptr<SharedTcpStream> c) : conn(c) {}
++  RequestContext(struct srpc_ctx* bw_ctx) {
++    this->bw_resp_len_addr = &bw_ctx->resp_len;
++    this->bw_resp_buf = bw_ctx->resp_buf;
++
++
++    preempt_disable();
++    this->bw_aes_ctx_ = EVP_CIPHER_CTX_new();
++    preempt_enable();
++    if (!this->bw_aes_ctx_)
++      throw std::bad_alloc();
++
++    memset(this->bw_aes_key_, 0xcc, sizeof(this->bw_aes_key_));
++    int ret = EVP_EncryptInit_ex(this->bw_aes_ctx_, EVP_aes_256_cbc(), NULL, this->bw_aes_key_, iv);
++    if (ret != 1)
++      panic("AES init %d", ret);
++  }
+   ~RequestContext() { free_buf(buf, bufsz); }
++
+   binary_header_blk_t header;
+   std::shared_ptr<SharedTcpStream> conn;
+   char *buf{nullptr};
+   size_t bufsz{0};
+ 
++  // daniel
++  // unlike bw_resp_buff we can't alias what we want to write into so we take its addr
++  size_t *bw_resp_len_addr;
++  char *bw_resp_buf;
++  EVP_CIPHER_CTX *bw_aes_ctx_;
++  unsigned char bw_aes_key_[32];
++
++
+   void *operator new(size_t size) {
+     void *p = smalloc(size);
+     if (unlikely(p == nullptr)) throw std::bad_alloc();
+     return p;
+   }
+   void operator delete(void *p) { sfree(p); }
++
++
++
++  ssize_t bw_EncryptStream(char *plaintext, size_t size, char *ciphertext) {
++    int ret;
++    int len;
++
++    if (size % 16 != 0)
++      return -EINVAL;
++
++    // todo
++    ret = EVP_EncryptUpdate(this->bw_aes_ctx_, (unsigned char *)ciphertext, &len, (unsigned char *)plaintext, size);
++    if (ret != 1)
++      return -EINVAL;
++
++    return len;
++  }
++
++  void bw_WritevFullLocked(const struct iovec *iov, int iovcnt) {
++
++    ssize_t sent = 0;
++    struct iovec vs[iovcnt];
++    memcpy(vs, iov, sizeof(*iov) * iovcnt);
++
++
++    for (int i = 0; i < iovcnt; i++) {
++      auto to_write = (char *)vs[i].iov_base;
++      auto to_write_len = vs[i].iov_len;
++
++      memcpy(this->bw_resp_buf + sent, to_write, to_write_len);
++      sent += to_write_len;
++    }
++    *this->bw_resp_len_addr = sent;
++  }
+ };
+ 
+ 
+ static void DoRequest(RequestContext *ctx, char *read_buf, char *compress_buf)
+ {
++  // todo! seems like I need to rewrite ctx->header to be the bytes written into the connection
+   size_t input_length = ctx->header.lba_count * kSectorSize;
+   ssize_t ret = storage_read(read_buf, ctx->header.lba, ctx->header.lba_count);
+   if (unlikely(ret != 0)) {
+@@ -163,9 +238,13 @@ static void DoRequest(RequestContext *ctx, char *read_buf, char *compress_buf)
+   snappy::RawCompress(read_buf, input_length,
+                       compress_buf, &compressed_length);
+ 
+-  rt::ScopedLock<rt::Mutex> l(&ctx->conn->sendMutex);
++  // todo! probably implicitly synchronized already in breakwater?
++  // like each thing gets a different slot it writes into
++  // and the slots get cleared by the runtime
++  // so no same-data access occurs
++  // rt::ScopedLock<rt::Mutex> l(&ctx->conn->sendMutex);
+ 
+-  ssize_t encrypt_len = ctx->conn->EncryptStream(compress_buf, align_up(compressed_length, 16), read_buf);
++  ssize_t encrypt_len = ctx->bw_EncryptStream(compress_buf, align_up(compressed_length, 16), read_buf);
+   if (unlikely(encrypt_len < 0))
+     panic("encrypt");
+ 
+@@ -182,11 +261,8 @@ static void DoRequest(RequestContext *ctx, char *read_buf, char *compress_buf)
+           .iov_len = (size_t)encrypt_len,
+       },
+   };
+-  ssize_t wret = ctx->conn->WritevFullLocked(response, 2);
+-  if (wret != static_cast<ssize_t>(sizeof(ctx->header) + encrypt_len)) {
+-    if (wret != -EPIPE && wret != -ECONNRESET)
+-      log_err_ratelimited("WritevFull failed: ret = %ld", wret);
+-  }
++  // todo!
++  ctx->bw_WritevFullLocked(response, 2);
+ }
+ 
+ 
+@@ -228,10 +304,14 @@ void HandleSetRequest(RequestContext *ctx) {
+   return;
+ 
+   ctx->header.tsc = rdtsc();
+-  ret = ctx->conn->WriteFull(&ctx->header, sizeof(ctx->header));
+-  if (ret != static_cast<ssize_t>(sizeof(ctx->header))) {
+-    if (ret != -EPIPE && ret != -ECONNRESET) log_err("tcp_write failed");
+-  }
++  // todo!
++
++  memcpy(ctx->bw_resp_buf, &ctx->header, sizeof(ctx->header));
++  *ctx->bw_resp_len_addr = sizeof(ctx->header);
++  // ret = ctx->conn->WriteFull(&ctx->header, sizeof(ctx->header));
++  // if (ret != static_cast<ssize_t>(sizeof(ctx->header))) {
++  //   if (ret != -EPIPE && ret != -ECONNRESET) log_err("tcp_write failed");
++  // }
+ }
+ 
+ void ServerWorker(std::shared_ptr<rt::TcpConn> c) {
+@@ -292,10 +372,61 @@ void ServerWorker(std::shared_ptr<rt::TcpConn> c) {
+   }
+ }
+ 
++void shenango_handler(struct srpc_ctx *bw_ctx) {
++
++    // todo! assign fields in the constructor that takes bw_ctx
++    auto ctx = new RequestContext(bw_ctx);
++
++    // need extra room b/c SET request has payload
++    if (unlikely(bw_ctx->req_len < sizeof(binary_header_blk_t))) {
++      log_err("got invalid RPC len %ld", bw_ctx->req_len);
++      delete ctx;
++      return;
++    }
++   
++    ctx->header = *reinterpret_cast<binary_header_blk_t *>(bw_ctx->req_buf);
++    binary_header_blk_t *h = &ctx->header;
++
++    /* validate request */
++    if (h->magic != sizeof(binary_header_blk_t) || (h->opcode != CMD_GET && h->opcode != CMD_SET)) {
++      log_err("invalid request %x %x %x", h->magic, h->opcode, h->lba_count);
++      delete ctx;
++      return;
++    }
++
++    size_t payload_size = h->lba_count * kSectorSize;
++
++    /* spawn thread to handle storage request + response */
++    if (h->opcode == CMD_SET) {
++      ctx->buf = allocate_buf(payload_size);
++      ctx->bufsz = payload_size;
++
++      if (bw_ctx->req_len < sizeof(binary_header_blk_t) + payload_size) {
++        log_err("got invalid RPC len %ld", bw_ctx->req_len);
++        delete ctx;
++        return;
++      }
++
++      memcpy(ctx->buf, bw_ctx->req_buf + sizeof(binary_header_blk_t), payload_size);
++      rt::Thread([=] { HandleSetRequest(ctx); delete ctx;}).Detach();
++      
++    } else {
++      size_t payload_size = ctx->header.lba_count * kSectorSize;
++      rt::Thread([=] {(payload_size > ON_STACK_THRESH) ? HandleGetRequest(ctx) : HandleGetRequestSmall(ctx); delete ctx; }).Detach();
++    }
++}
++
+ void MainHandler(void *arg) {
+   if (kSectorSize != storage_block_size())
+     panic("storage not enabled");
+ 
++
++  int ret = srpc_ops->srpc_enable(shenango_handler);
++  if (ret) panic("couldn't enable RPC server");
++
++  for (;;); // make sure main program doesn't exit cause 
++  // rt::WaitGroup(1).Wait(); // from breakwater/netbench.cc
++
+   std::unique_ptr<rt::TcpQueue> q(
+       rt::TcpQueue::Listen({0, kStorageServicePort}, 4096));
+   if (q == nullptr) panic("couldn't listen for connections");
+@@ -307,19 +438,129 @@ void MainHandler(void *arg) {
+   }
+ }
+ 
++static void rpc_stat_worker(void *arg) {
++  tcpconn_t *c = reinterpret_cast<tcpconn_t *>(arg);
++  struct {
++    uint64_t idle;
++    uint64_t busy;
++    unsigned int num_cores;
++    unsigned int max_cores;
++    uint64_t winu_rx;
++    uint64_t winu_tx;
++    uint64_t win_tx;
++    uint64_t req_rx;
++    uint64_t req_dropped;
++    uint64_t resp_tx;
++  } sstat_raw;
++
++  uint64_t magic;
++  ssize_t ret;
++  ssize_t done;
++
++  while(true) {
++
++    log_err("rpc_stat_worker - new connection");
++
++    ret = tcp_read(c, &magic, sizeof(magic));
++
++    if (ret <= 0) goto done;
++
++    if (ret != (ssize_t)sizeof(magic) || ntoh64(magic) != RPC_STAT_MAGIC) {
++      WARN();
++      goto done;
++    }
++
++    sstat_raw.idle = 0; // not supported yet
++    sstat_raw.busy = 0; // not supported yet
++    sstat_raw.num_cores = runtime_max_cores();
++    sstat_raw.max_cores = (unsigned int)sysconf(_SC_NPROCESSORS_ONLN);
++    sstat_raw.winu_rx = srpc_ops->srpc_stat_cupdate_rx(); //srpc_stat_winu_rx();
++    sstat_raw.winu_tx = srpc_ops->srpc_stat_ecredit_tx() ; //srpc_stat_winu_tx();
++    sstat_raw.win_tx = srpc_ops->srpc_stat_credit_tx(); //srpc_stat_win_tx();
++    sstat_raw.req_rx = srpc_ops->srpc_stat_req_rx();
++    sstat_raw.req_dropped = srpc_ops->srpc_stat_req_dropped();
++    sstat_raw.resp_tx = srpc_ops->srpc_stat_resp_tx();
++
++    done = 0;
++    do {
++      ret = tcp_write(c, (char *)&sstat_raw + done, sizeof(sstat_raw) - done);
++      if (ret < 0) {
++        WARN_ON(ret != -EPIPE && ret != -ECONNRESET);
++        goto done;
++      }
++      done += ret;
++    } while (done < sizeof(sstat_raw));
++  }
++  done:
++  tcp_close(c);
++  return;
++}
++
++static void rpc_stat_server(void *arg) {
++  struct netaddr laddr;
++  tcpconn_t *c;
++  tcpqueue_t *q;
++  int ret;
++
++  laddr.ip = 0;
++  laddr.port = RPC_STAT_PORT;
++
++  log_err("listening for RPC stats on port %d", RPC_STAT_PORT);
++
++  ret = tcp_listen(laddr, 4096, &q);
++
++  log_err("tcp_listen returned %d", ret);
++
++  BUG_ON(ret);
++
++  while(true) {
++
++      log_err("rpc_stat_server - waiting for connection");
++
++      ret = tcp_accept(q, &c);
++
++      log_err("tcp_accept returned %d", ret);
++
++      BUG_ON(ret);
++      ret = thread_spawn(rpc_stat_worker, c);
++      WARN_ON(ret);
++  }
++}
++
+ int main(int argc, char *argv[]) {
+   int ret;
+ 
+-  if (argc < 2) {
+-    std::cerr << "usage: [cfg_file]" << std::endl;
++  if (argc < 3) {
++    std::cerr << "usage: oc_alg [cfg_file]" << std::endl;
+     return -EINVAL;
+   }
+ 
+-  ret = runtime_init(argv[1], MainHandler, NULL);
++  srpc_ops = &sbw_ops;
++  std::string olcalg = (char *)argv[1];
++  if (olcalg.compare("breakwater") == 0) {
++    crpc_ops = &cbw_ops;
++    srpc_ops = &sbw_ops;
++  } else if (olcalg.compare("dagor") == 0) {
++    crpc_ops = &cdg_ops;
++    srpc_ops = &sdg_ops;
++  } else if (olcalg.compare("seda") == 0) {
++    crpc_ops = &csd_ops;
++    srpc_ops = &ssd_ops;
++  } else if (olcalg.compare("nocontrol") == 0) {
++    crpc_ops = &cnc_ops;
++    srpc_ops = &snc_ops;
++  } else {
++    std::cerr << "Invalid overload control algorithm: " << olcalg << std::endl;
++    return -1;
++  }
++
++  ret = runtime_init(argv[2], MainHandler, NULL);
+   if (ret) {
+     std::cerr << "failed to start runtime" << std::endl;
+     return ret;
+   }
+ 
++  ret = thread_spawn(rpc_stat_server, NULL);
++
+   return 0;
+ }
