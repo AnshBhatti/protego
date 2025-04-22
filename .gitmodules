@@ -1,17 +1,9 @@
-[submodule "gc"]
-	path = gc
-	url = https://github.com/shenango/boehmGC.git
-[submodule "parsec"]
-	path = parsec
-	url = https://github.com/shenango/parsec.git
-[submodule "memcached"]
-	path = memcached
-	url = https://github.com/estuhr1206/memcached.git
-	branch = coresync
-[submodule "caladan"]
-	path = caladan
+[submodule "caladan-overload-control"]
+	path = caladan-overload-control
 	url = https://github.com/estuhr1206/caladan-overload-control.git
-	branch = breakwater_core_park_fix
 [submodule "silo"]
 	path = silo
 	url = https://github.com/shenango/silo.git
+[submodule "memcached"]
+	path = memcached
+	url = https://github.com/estuhr1206/memcached.git
